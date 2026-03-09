@@ -44,6 +44,8 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import urllib.request as _urllib_request
 import ssl as _ssl
+from typing import Optional
+from fastapi import Header
 
 
 # Email via Resend (preferred). If RESEND_API_KEY is missing, email sending is skipped.
