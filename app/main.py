@@ -3755,10 +3755,7 @@ async def chat_stream(
     if not message:
         raise HTTPException(400, "message required")
 
-    tenant = (inp.tenant or org or "").strip() or org
-    if tenant != org:
-        # Guard: tenant from payload must not override JWT tenant
-        tenant = org
+    tenant = org
 
     agent_id = inp.agent_id
     top_k = int(inp.top_k or 6)
