@@ -1,14 +1,6 @@
 from __future__ import annotations
 
 import os
-
-# ===============================
-# REALTIME VAD CONFIG
-# ===============================
-REALTIME_VAD_THRESHOLD = float(os.getenv("REALTIME_VAD_THRESHOLD", "0.85"))
-REALTIME_VAD_SILENCE_MS = int(os.getenv("REALTIME_VAD_SILENCE_MS", "1200"))
-REALTIME_VAD_PREFIX_PADDING_MS = int(os.getenv("REALTIME_VAD_PREFIX_PADDING_MS", "300"))
-
 import logging
 import hashlib
 import json, time, uuid, re
@@ -44,8 +36,6 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import urllib.request as _urllib_request
 import ssl as _ssl
-from typing import Optional
-from fastapi import Header
 
 
 # Email via Resend (preferred). If RESEND_API_KEY is missing, email sending is skipped.
@@ -103,12 +93,6 @@ _CHAT_MAX_PER_MINUTE = int(os.getenv("CHAT_MAX_PER_MINUTE", "30"))
 
 _rl_realtime_lock = _threading.Lock()
 _rl_realtime_calls: dict = {}  # {user_id: [ts...]}
-
-# Founder handoff dedicated rate limit
-_handoff_rl_lock = _threading.Lock()
-_handoff_rl_calls: dict = {}  # {key: [ts...]}
-_FOUNDER_HANDOFF_MAX_PER_10M = int(os.getenv("FOUNDER_HANDOFF_MAX_PER_10M", "3"))
-
 _REALTIME_MAX_PER_MINUTE = int(os.getenv("REALTIME_MAX_PER_MINUTE", "30"))
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "20"))
 
@@ -146,8 +130,10 @@ SUMMIT_STD_REALTIME_MAX_MIN_DAY = int(os.getenv("SUMMIT_STD_REALTIME_MAX_MIN_DAY
 # Optional OpenAI
 try:
     from openai import OpenAI
-except Exception:
+    _OPENAI_IMPORT_ERROR = None
+except Exception as e:
     OpenAI = None  # type: ignore
+    _OPENAI_IMPORT_ERROR = str(e)
 
 
 
@@ -347,33 +333,12 @@ def admin_emails() -> List[str]:
         return []
     return [x.strip().lower() for x in raw.split(",") if x.strip()]
 
-
-def _summit_mode_enabled() -> bool:
-    return os.getenv("SUMMIT_MODE", "0").strip().lower() in ("1", "true", "yes", "on")
-
-
 def resolve_stt_language(preferred: Optional[str] = None) -> Optional[str]:
-    """Resolve transcription language.
-    Priority:
-      1) explicit preferred language
-      2) SUMMIT_STT_LANGUAGE (event-specific)
-      3) OPENAI_STT_LANGUAGE / OPENAI_REALTIME_TRANSCRIBE_LANGUAGE
-      4) pt-BR only when SUMMIT_MODE is enabled
-      5) provider auto-detect otherwise
-    Empty/auto => provider auto-detect.
-    """
-    candidates = [
-        preferred,
-        os.getenv("SUMMIT_STT_LANGUAGE", ""),
-        os.getenv("OPENAI_STT_LANGUAGE", ""),
-        os.getenv("OPENAI_REALTIME_TRANSCRIBE_LANGUAGE", ""),
-    ]
-    lang = next(((c or "").strip() for c in candidates if (c or "").strip()), "")
-    if not lang and _summit_mode_enabled():
-        lang = "pt-BR"
-    if lang.lower() in ("", "auto"):
+    """Resolve transcription language. Empty/auto => provider auto-detect."""
+    lang = (preferred or os.getenv("OPENAI_STT_LANGUAGE", "") or os.getenv("OPENAI_REALTIME_TRANSCRIBE_LANGUAGE", "")).strip()
+    if lang.lower() == "auto":
         return None
-    return lang
+    return lang or None
 
 def _ensure_admin_user_state(u: Optional[User]) -> bool:
     """Best-effort structural admin promotion for configured emails."""
@@ -680,22 +645,6 @@ class ContactIn(BaseModel):
     consent_marketing: bool = False
     terms_version: str = TERMS_VERSION
 
-
-
-class FounderHandoffIn(BaseModel):
-    thread_id: Optional[str] = None
-    interest_type: str = Field(default="general", min_length=2, max_length=50)
-    message: str = Field(min_length=3, max_length=2000)
-    source: str = Field(default="app_console", min_length=2, max_length=50)
-    consent_contact: bool = Field(default=True)
-
-
-class FounderHandoffOut(BaseModel):
-    ok: bool = True
-    code: str = "FOUNDER_HANDOFF_CREATED"
-    contact_request_id: str
-    thread_id: Optional[str] = None
-
 class SignupCodeIn(BaseModel):
     label: str = Field(min_length=1, max_length=100)
     source: str = Field(default="invite")  # pitch | invite
@@ -740,6 +689,7 @@ class ChatOut(BaseModel):
     agent_id: Optional[str] = None
     agent_name: Optional[str] = None
     voice_id: Optional[str] = None
+    avatar_url: Optional[str] = None
     
 # =========================
 # Idempotency helpers
@@ -1731,18 +1681,9 @@ def _get_feature_flag(db: Session, org: str, key: str) -> Optional[str]:
             select(FeatureFlag).where(FeatureFlag.org_slug == org, FeatureFlag.flag_key == key)
         ).scalar_one_or_none()
         return ff.flag_value if ff else None
-    except Exception as e:
-        msg = str(e)
-        low = msg.lower()
-        code = None
-        if "rate" in low and "limit" in low or "429" in low:
-            code = "SERVER_BUSY"
-        elif "overload" in low or "overloaded" in low or "temporarily unavailable" in low or "server busy" in low:
-            code = "SERVER_BUSY"
-        elif "timeout" in low or "timed out" in low:
-            code = "TIMEOUT"
-        return {"code": code or "LLM_ERROR", "error": msg, "message": msg, "text": "", "usage": None, "model": model}
-
+    except Exception:
+        logger.exception("FEATURE_FLAG_READ_FAILED org=%s key=%s", org, key)
+        return None
 
 
 @app.post("/api/auth/register", response_model=TokenOut)
@@ -2032,17 +1973,57 @@ def _openai_answer(
     Returns dict:
       {text, usage, model} on success
       {code, error, message} on known failures (SERVER_BUSY, TIMEOUT, LLM_ERROR)
-      None only if OpenAI client is unavailable/misconfigured.
+      None only if an unexpected internal failure occurs before classification.
     """
-    key = os.getenv("OPENAI_API_KEY", "").strip()
-    model = (model_override or os.getenv("OPENAI_MODEL", "gpt-4o-mini")).strip()
-    if not key or OpenAI is None:
-        return None
+    key = _clean_env(os.getenv("OPENAI_API_KEY", ""), default="").strip()
+    model = (
+        _clean_env(model_override, default="").strip()
+        or _clean_env(os.getenv("OPENAI_MODEL", ""), default="").strip()
+        or _clean_env(os.getenv("DEFAULT_CHAT_MODEL", ""), default="").strip()
+        or "gpt-4o-mini"
+    )
+
+    if not key:
+        return {
+            "code": "LLM_ERROR",
+            "error": "missing_openai_key",
+            "message": "OPENAI_API_KEY ausente",
+            "text": "",
+            "usage": None,
+            "model": model,
+        }
+
+    if OpenAI is None:
+        return {
+            "code": "LLM_ERROR",
+            "error": "openai_client_unavailable",
+            "message": _OPENAI_IMPORT_ERROR or "biblioteca openai indisponível",
+            "text": "",
+            "usage": None,
+            "model": model,
+        }
+
     try:
-        timeout_s = float(os.getenv("OPENAI_TIMEOUT") or os.getenv("LLM_TIMEOUT") or "45")
+        timeout_s = float(
+            _clean_env(os.getenv("OPENAI_TIMEOUT", ""), default="")
+            or _clean_env(os.getenv("LLM_TIMEOUT", ""), default="")
+            or "45"
+        )
     except Exception:
         timeout_s = 45.0
-    client = OpenAI(api_key=key, timeout=timeout_s)
+
+    try:
+        client = OpenAI(api_key=key, timeout=timeout_s)
+    except Exception as e:
+        msg = str(e) or "openai_client_init_failed"
+        return {
+            "code": "LLM_ERROR",
+            "error": "openai_client_init_failed",
+            "message": msg,
+            "text": "",
+            "usage": None,
+            "model": model,
+        }
 
     # Build context string (RAG)
     ctx = ""
@@ -2096,26 +2077,43 @@ def _openai_answer(
         if temperature is not None:
             kwargs["temperature"] = temperature
         r = client.chat.completions.create(**kwargs)
-        return {"text": (r.choices[0].message.content or "").strip(), "usage": getattr(r, "usage", None), "model": model}
+
+        answer_text = ""
+        try:
+            answer_text = ((r.choices or [])[0].message.content or "").strip()
+        except Exception:
+            answer_text = ""
+
+        return {
+            "text": answer_text,
+            "usage": getattr(r, "usage", None),
+            "model": model,
+        }
     except Exception as e:
-        # WAR-ROOM PATCH: expose the real provider failure in Railway logs
-        # instead of collapsing everything into a silent generic failure.
-        logger.exception("OPENAI_ANSWER_EXCEPTION model=%s timeout=%s", model, timeout_s)
-
-        # Classify failures for frontend retry policy.
-        s = str(e).lower()
+        msg = str(e) or "LLM_ERROR"
+        low = msg.lower()
         code = "LLM_ERROR"
-        if "timeout" in s or "timed out" in s:
-            code = "TIMEOUT"
-        # OpenAI overload / rate limits / 429 / "server is busy"
-        if ("rate limit" in s) or ("429" in s) or ("overload" in s) or ("server is busy" in s) or ("too many requests" in s):
-            code = "SERVER_BUSY"
 
-        msg = str(e) or code
+        if (
+            "rate limit" in low
+            or "429" in low
+            or "overload" in low
+            or "overloaded" in low
+            or "server is busy" in low
+            or "too many requests" in low
+            or "quota" in low
+        ):
+            code = "SERVER_BUSY"
+        elif "timeout" in low or "timed out" in low:
+            code = "TIMEOUT"
+
         return {
             "code": code,
-            "error": f"{type(e).__name__}: {msg}",
-            "message": f"{type(e).__name__}: {msg}",
+            "error": msg,
+            "message": msg,
+            "text": "",
+            "usage": None,
+            "model": model,
         }
 
 
@@ -2417,7 +2415,15 @@ def chat(
 
         if ans_obj and ans_obj.get("code") and not answer:
             # surface structured error
-            raise HTTPException(status_code=503, detail=ans_obj.get("code") or "LLM_ERROR")
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": ans_obj.get("code") or "LLM_ERROR",
+                    "error": ans_obj.get("error") or "provider_failure",
+                    "message": ans_obj.get("message") or "LLM provider failure",
+                    "model": ans_obj.get("model"),
+                },
+            )
 
         if not answer:
             if citations:
@@ -3766,7 +3772,10 @@ async def chat_stream(
     if not message:
         raise HTTPException(400, "message required")
 
-    tenant = org
+    tenant = (inp.tenant or org or "").strip() or org
+    if tenant != org:
+        # Guard: tenant from payload must not override JWT tenant
+        tenant = org
 
     agent_id = inp.agent_id
     top_k = int(inp.top_k or 6)
@@ -3822,14 +3831,15 @@ async def chat_stream(
 
     # Persist user message once (idempotent via client_message_id if provided)
     try:
-        m_user, created = _get_or_create_user_message(
+        m_user = _get_or_create_user_message(
             db,
-            org,
-            tid,
-            user,
-            inp.message,
-            getattr(inp, "client_message_id", None),
+            org=org,
+            thread_id=tid,
+            user_id=uid,
+            content=message,
+            client_message_id=client_message_id,
         )
+        db.commit()
     except Exception:
         try:
             db.rollback()
@@ -3939,7 +3949,7 @@ async def chat_stream(
                     # If server is busy, tell frontend to retry and end stream early
                     if code == "SERVER_BUSY":
                         try:
-                            yield sse_event("error", {"code": "SERVER_BUSY", "message": "SERVER_BUSY", "error": msg, "trace_id": trace_id})
+                            yield sse_event("error", {"code": "SERVER_BUSY", "message": msg or "SERVER_BUSY", "error": msg, "trace_id": trace_id})
                             yield sse_event("done", {"done": True, "thread_id": tid, "trace_id": trace_id})
                         except Exception:
                             return
@@ -4393,13 +4403,7 @@ async def realtime_client_secret(
             "output": {"voice": voice},
             # Let the server detect turns for lowest-latency voice UX
             "input": {
-                "turn_detection": {
-        "type": "server_vad",
-        "threshold": REALTIME_VAD_THRESHOLD,
-        "silence_duration_ms": REALTIME_VAD_SILENCE_MS,
-        "prefix_padding_ms": REALTIME_VAD_PREFIX_PADDING_MS,
-        "create_response": True
-    },
+                "turn_detection": {"type": "server_vad", "create_response": True},
                 # Optional transcription for UI captions / logs
                 "transcription": {
                     **({"language": resolved_language} if resolved_language else {}),
@@ -5212,119 +5216,6 @@ def login_verify_otp(inp: OtpVerifyIn, request: Request = None, db: Session = De
         pass
 
     return {"access_token": token, "token_type": "bearer", "user": {"id": u.id, "email": u.email, "name": u.name, "role": u.role, "approved_at": getattr(u, "approved_at", None), "usage_tier": usage_tier}}
-
-
-
-
-@app.post("/api/founder/handoff", response_model=FounderHandoffOut)
-def founder_handoff(
-    inp: FounderHandoffIn,
-    request: Request,
-    x_org_slug: Optional[str] = Header(default=None),
-    user=Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    org = _resolve_org(user, x_org_slug)
-    user_id = (user.get("sub") or "").strip()
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    if not inp.consent_contact:
-        raise HTTPException(status_code=400, detail={"code": "FOUNDER_HANDOFF_CONSENT_REQUIRED", "message": "Consentimento é obrigatório para acionar Daniel."})
-
-    ip = (request.client.host if request and request.client else "unknown")
-    rate_keys = [
-        f"user:{user_id}",
-        f"ip:{ip}",
-        f"thread:{inp.thread_id.strip()}" if inp.thread_id else None,
-    ]
-    for key in [k for k in rate_keys if k]:
-        if not _rate_limit_check(_handoff_rl_lock, _handoff_rl_calls, key, _FOUNDER_HANDOFF_MAX_PER_10M, window=600):
-            raise HTTPException(status_code=429, detail={"code": "FOUNDER_HANDOFF_LIMIT", "message": "Muitas solicitações de contato. Aguarde alguns minutos."})
-
-    db_user = db.execute(
-        select(User).where(
-            User.id == user_id,
-            User.org_slug == org,
-        )
-    ).scalar_one_or_none()
-    if not db_user:
-        raise HTTPException(status_code=404, detail="Usuário não encontrado")
-
-    thread_id = (inp.thread_id or "").strip() or None
-    if thread_id:
-        th = db.execute(
-            select(Thread).where(
-                Thread.id == thread_id,
-                Thread.org_slug == org,
-            )
-        ).scalar_one_or_none()
-        if not th:
-            raise HTTPException(status_code=404, detail={"code": "THREAD_NOT_FOUND", "message": "Thread não encontrada"})
-        _require_thread_member(db, org, thread_id, user_id)
-
-    clean_interest = (inp.interest_type or "general").strip().lower()
-    clean_source = (inp.source or "app_console").strip().lower()
-    clean_message = (inp.message or "").strip()
-    if not clean_message:
-        raise HTTPException(status_code=400, detail={"code": "FOUNDER_HANDOFF_MESSAGE_REQUIRED", "message": "Mensagem é obrigatória"})
-
-    subject_map = {
-        "investor": "Investor interest",
-        "investment": "Investor interest",
-        "sales": "Orkio SaaS interest",
-        "saas": "Orkio SaaS interest",
-        "partnership": "Partnership interest",
-        "general": "Founder handoff",
-    }
-    subject = subject_map.get(clean_interest, "Founder handoff")
-    if thread_id:
-        subject = f"{subject} · Thread {thread_id}"
-
-    cr = ContactRequest(
-        id=new_id(),
-        full_name=(db_user.name or db_user.email or "Usuário").strip(),
-        email=(db_user.email or "").strip().lower(),
-        whatsapp=None,
-        subject=subject,
-        message=clean_message,
-        privacy_request_type=None,
-        consent_terms=True,
-        consent_marketing=bool(getattr(db_user, "marketing_consent", False)),
-        ip_address=ip,
-        user_agent=(request.headers.get("user-agent", "") if request else ""),
-        terms_version=getattr(db_user, "terms_version", None) or TERMS_VERSION,
-        status="pending",
-        retention_until=now_ts() + (365 * 86400),
-        created_at=now_ts(),
-    )
-    db.add(cr)
-    db.commit()
-
-    meta = {
-        "thread_id": thread_id,
-        "interest_type": clean_interest,
-        "source": clean_source,
-        "contact_request_id": cr.id,
-        "email": db_user.email,
-    }
-    _audit(db, org, user_id, "founder.handoff_requested", meta=meta)
-
-    try:
-        body = (
-            f"Novo handoff para founder\n\n"
-            f"Nome: {db_user.name}\n"
-            f"Email: {db_user.email}\n"
-            f"Tenant: {org}\n"
-            f"Thread: {thread_id or '-'}\n"
-            f"Interesse: {clean_interest}\n"
-            f"Origem: {clean_source}\n\n"
-            f"Mensagem:\n{clean_message}\n"
-        )
-        _send_resend_email(RESEND_INTERNAL_TO, f"[ORKIO] {subject}", body)
-    except Exception:
-        logger.exception("FOUNDER_HANDOFF_NOTIFY_FAILED")
-
-    return FounderHandoffOut(contact_request_id=cr.id, thread_id=thread_id)
 
 
 # ── Contact / LGPD endpoints ──────────────────────────────────────────
