@@ -3813,15 +3813,14 @@ async def chat_stream(
 
     # Persist user message once (idempotent via client_message_id if provided)
     try:
-        m_user = _get_or_create_user_message(
+        m_user, created = _get_or_create_user_message(
             db,
-            org=org,
-            thread_id=tid,
-            user_id=uid,
-            content=message,
-            client_message_id=client_message_id,
+            org,
+            tid,
+            user,
+            inp.message,
+            getattr(inp, "client_message_id", None),
         )
-        db.commit()
     except Exception:
         try:
             db.rollback()
