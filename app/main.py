@@ -2098,6 +2098,10 @@ def _openai_answer(
         r = client.chat.completions.create(**kwargs)
         return {"text": (r.choices[0].message.content or "").strip(), "usage": getattr(r, "usage", None), "model": model}
     except Exception as e:
+        # WAR-ROOM PATCH: expose the real provider failure in Railway logs
+        # instead of collapsing everything into a silent generic failure.
+        logger.exception("OPENAI_ANSWER_EXCEPTION model=%s timeout=%s", model, timeout_s)
+
         # Classify failures for frontend retry policy.
         s = str(e).lower()
         code = "LLM_ERROR"
@@ -2106,8 +2110,13 @@ def _openai_answer(
         # OpenAI overload / rate limits / 429 / "server is busy"
         if ("rate limit" in s) or ("429" in s) or ("overload" in s) or ("server is busy" in s) or ("too many requests" in s):
             code = "SERVER_BUSY"
+
         msg = str(e) or code
-        return {"code": code, "error": msg, "message": msg}
+        return {
+            "code": code,
+            "error": f"{type(e).__name__}: {msg}",
+            "message": f"{type(e).__name__}: {msg}",
+        }
 
 
 
